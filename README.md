@@ -1,5 +1,4 @@
-# rocm-stress-test
-MI300x benchmarking code
+# rcc_rocm_stress_test
 
 This code was written to stress test local MI300x and more generally, MI series AMD GPUs - but to be portable and free of major library or system OS level dependencies.
 
@@ -43,10 +42,10 @@ This code was written to stress test local MI300x and more generally, MI series 
 
 # How to compile
 
-```hipcc concurrent_stress_test.cpp -o concurrent_stress_test -lhipblas -pthread -lpthread```
+```hipcc rcc_rocm_stress_test.cpp -o rcc_rocm_stress_test -lhipblas -pthread -lpthread```
 
 # How to run
 
 * To run for 60 seconds on 8 GPUs:
 
-```./concurrent_stress_test 60 8```
+```./rcc_rocm_stress_test 60 8```
