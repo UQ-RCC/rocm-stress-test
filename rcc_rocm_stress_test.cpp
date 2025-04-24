@@ -256,6 +256,72 @@ void run_gpu_stress(int device_id, double test_duration_sec, int m, int n, int k
     }
 }
 
+
+// Function to run a peer-to-peer bandwidth test between two GPUs
+void run_gpu_peer_bandwidth_test(int src_device_id, int dst_device_id, size_t data_size_bytes, int num_iterations) {
+    void *d_src = nullptr, *d_dst = nullptr;
+    hipEvent_t start_event = nullptr, stop_event = nullptr;
+    double total_time = 0.0;
+
+    try {
+        // Set source and destination devices
+        HIP_CHECK(hipSetDevice(src_device_id));
+
+        // Allocate memory on source device
+        HIP_CHECK(hipMalloc(&d_src, data_size_bytes));
+        // Initialize source memory (optional, but good practice)
+        HIP_CHECK(hipMemset(d_src, 1, data_size_bytes));
+
+
+        HIP_CHECK(hipSetDevice(dst_device_id));
+
+        // Allocate memory on destination device
+        HIP_CHECK(hipMalloc(&d_dst, data_size_bytes));
+         // Initialize destination memory (optional, but good practice)
+        HIP_CHECK(hipMemset(d_dst, 0, data_size_bytes));
+
+        HIP_CHECK(hipEventCreate(&start_event));
+        HIP_CHECK(hipEventCreate(&stop_event));
+
+        {
+            std::lock_guard<std::mutex> lock(print_mutex);
+            std::cout << "\n  Starting bandwidth test: Device " << src_device_id << " -> Device " << dst_device_id << "..." << std::endl;
+        }
+
+        // Run bandwidth test
+        for (int i = 0; i < num_iterations; ++i) {
+            HIP_CHECK(hipEventRecord(start_event, 0));
+            HIP_CHECK(hipMemcpyPeer(d_dst, dst_device_id, d_src, src_device_id, data_size_bytes));
+            HIP_CHECK(hipEventRecord(stop_event, 0));
+            HIP_CHECK(hipEventSynchronize(stop_event));
+            total_time += time_gpu_event(start_event, stop_event);
+        }
+
+        double average_time = total_time / num_iterations;
+        double bandwidth_gb_sec = (double)data_size_bytes / (average_time * 1e9); // Convert bytes/sec to GB/sec
+
+        {
+            std::lock_guard<std::mutex> lock(print_mutex);
+            std::cout << "  Bandwidth Device " << src_device_id << " -> Device " << dst_device_id << ": "
+                      << bandwidth_gb_sec << " GB/s (" << data_size_bytes << " bytes transferred per iteration, "
+                      << num_iterations << " iterations)" << std::endl;
+        }
+
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cerr << "Error in bandwidth test thread (" << src_device_id << " -> " << dst_device_id << "): " << e.what() << std::endl;
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(print_mutex);
+        std::cerr << "Unknown error in bandwidth test thread (" << src_device_id << " -> " << dst_device_id << ")" << std::endl;
+    }
+
+    // Clean up resources
+    if (start_event) HIP_CHECK(hipEventDestroy(start_event));
+    if (stop_event) HIP_CHECK(hipEventDestroy(stop_event));
+    if (d_src) HIP_CHECK(hipFree(d_src));
+    if (d_dst) HIP_CHECK(hipFree(d_dst));
+}
+
 int main(int argc, char* argv[]) {
     double test_duration_sec = 10.0; // Default duration per GPU per precision cycle
     int num_gpus_to_target = -1;    // Default to all available GPUs
@@ -350,6 +416,117 @@ int main(int argc, char* argv[]) {
         }
     }
     std::cout << "\n--- FP32 Testing Cycle Finished ---" << std::endl;
+
+
+    // --- Starting Inter-GPU Bandwidth Test ---
+    std::cout << "\n--- Starting Inter-GPU Bandwidth Test ---" << std::endl;
+
+    size_t bandwidth_test_size = 1024 * 1024 * 1024; // 1 GB per transfer
+    int bandwidth_test_iterations = 10;
+
+    std::cout << "Transfer size per iteration: " << bandwidth_test_size << " bytes (" << bandwidth_test_size / (1024.0*1024.0*1024.0) << " GB)" << std::endl;
+    std::cout << "Number of iterations per test: " << bandwidth_test_iterations << std::endl;
+
+    // Enable peer access for all pairs before testing
+    std::cout << "\nEnabling peer access..." << std::endl;
+    for (int i = 0; i < actual_gpus_to_test; ++i) {
+        for (int j = 0; j < actual_gpus_to_test; ++j) { // Corrected loop bound
+            if (i != j) {
+                int canAccessPeer;
+                hipError_t can_access_status = hipDeviceCanAccessPeer(&canAccessPeer, i, j);
+                if (can_access_status != hipSuccess) {
+                     std::lock_guard<std::mutex> lock(print_mutex);
+                     std::cerr << "Warning: Could not check peer access between Device " << i << " and " << j << ": " << hipGetErrorString(can_access_status) << std::endl;
+                     continue; // Skip enabling for this pair if check fails
+                }
+                if (canAccessPeer) {
+                     // Set device context before enabling peer access from device i to device j
+                     HIP_CHECK(hipSetDevice(i)); // Set context to source device
+                     hipError_t enable_status_ij = hipDeviceEnablePeerAccess(j, 0);
+                     if (enable_status_ij != hipSuccess && enable_status_ij != hipErrorPeerAccessAlreadyEnabled) {
+                         std::lock_guard<std::mutex> lock(print_mutex);
+                         std::cerr << "Warning: Could not enable peer access from Device " << i << " to " << j << ": " << hipGetErrorString(enable_status_ij) << std::endl;
+                     } else if (enable_status_ij == hipSuccess) {
+                          std::lock_guard<std::mutex> lock(print_mutex);
+                          std::cout << "  Peer access enabled from Device " << i << " to " << j << "." << std::endl;
+                     }
+
+                     // Set device context before enabling peer access from device j to device i
+                     HIP_CHECK(hipSetDevice(j)); // Set context to source device
+                     hipError_t enable_status_ji = hipDeviceEnablePeerAccess(i, 0);
+                      if (enable_status_ji != hipSuccess && enable_status_ji != hipErrorPeerAccessAlreadyEnabled) {
+                         std::lock_guard<std::mutex> lock(print_mutex);
+                         std::cerr << "Warning: Could not enable peer access from Device " << j << " to " << i << ": " << hipGetErrorString(enable_status_ji) << std::endl;
+                     } else if (enable_status_ji == hipSuccess) {
+                         std::lock_guard<std::mutex> lock(print_mutex);
+                         std::cout << "  Peer access enabled from Device " << j << " to " << i << "." << std::endl;
+                     }
+
+                } else {
+                    std::lock_guard<std::mutex> lock(print_mutex);
+                    std::cout << "  Peer access not possible between Device " << i << " and Device " << j << ". Bandwidth test will be skipped for this pair." << std::endl;
+                }
+            }
+        }
+    }
+    std::cout << "Peer access enabling complete." << std::endl;
+
+
+    std::vector<std::thread> bandwidth_threads;
+    for (int i = 0; i < actual_gpus_to_test; ++i) {
+        for (int j = 0; j < actual_gpus_to_test; ++j) {
+            if (i != j) {
+                // Check if peer access is possible before launching thread
+                 int canAccessPeer;
+                 hipError_t can_access_status = hipDeviceCanAccessPeer(&canAccessPeer, i, j);
+                 if (can_access_status == hipSuccess && canAccessPeer) {
+                    bandwidth_threads.push_back(std::thread(run_gpu_peer_bandwidth_test, i, j, bandwidth_test_size, bandwidth_test_iterations));
+                 } else if (can_access_status != hipSuccess) {
+                    std::lock_guard<std::mutex> lock(print_mutex);
+                    std::cerr << "Warning: Could not check peer access between Device " << i << " and " << j << ". Skipping bandwidth test for this pair." << std::endl;
+                 }
+            }
+        }
+    }
+
+    // Join threads to wait for all bandwidth tests to complete
+    for (std::thread& thread : bandwidth_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    std::cout << "\n--- Inter-GPU Bandwidth Test Finished ---" << std::endl;
+
+    // Disable peer access for all pairs after testing
+    std::cout << "\nDisabling peer access..." << std::endl;
+     for (int i = 0; i < actual_gpus_to_test; ++i) {
+        for (int j = 0; j < actual_gpus_to_test; ++j) {
+            if (i != j) {
+                int canAccessPeer;
+                // Check if peer access was possible before attempting to disable
+                hipError_t can_access_status = hipDeviceCanAccessPeer(&canAccessPeer, i, j);
+
+                if (can_access_status == hipSuccess && canAccessPeer) {
+                    // Set device context before disabling from device i to device j
+                    HIP_CHECK(hipSetDevice(i));
+                    hipError_t disable_status_ij = hipDeviceDisablePeerAccess(j);
+                     if (disable_status_ij != hipSuccess && disable_status_ij != hipErrorPeerAccessNotEnabled) {
+                         std::lock_guard<std::mutex> lock(print_mutex);
+                         std::cerr << "Warning: Could not disable peer access from Device " << i << " to " << j << ": " << hipGetErrorString(disable_status_ij) << std::endl;
+                     } else if (disable_status_ij == hipSuccess) {
+                         std::lock_guard<std::mutex> lock(print_mutex);
+                         std::cout << "  Peer access disabled from Device " << i << " to " << " j " << "." << std::endl;
+                     }
+
+                } else if (can_access_status != hipSuccess) {
+                     std::lock_guard<std::mutex> lock(print_mutex);
+                     std::cerr << "Warning: Could not check peer access between Device " << i << " and " << j << ". Skipping peer access disabling from Device " << i << " to " << j << "." << std::endl;
+                }
+            }
+        }
+    }
+
+    std::cout << "Peer access disabling complete." << std::endl;
 
 
     std::cout << "\n--- Concurrent Stress Test Finished ---" << std::endl;
