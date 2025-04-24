@@ -11,6 +11,7 @@ This code was written to stress test local MI300x and more generally, MI series 
 * Includes necessary headers for HIP runtime (hip_runtime.h), hipBLAS (hipblas.h), and half/bfloat16 types (hip_fp16.h, hip_bfloat16.h).
 * Multi-GPU concurrent testing
 * A HBM check to determine the maximum amount of memory allocable
+* Memory bandwidth xGMI Peer-to-Peer bandwidth testing
 * Error Checking Macros: HIP_CHECK and HIPBLAS_CHECK are simple macros for checking the return status of HIP and hipBLAS API calls and exiting if an error occurs.
 * time_gpu_event Function: A helper to calculate the elapsed time between two HIP events in seconds.
 * copy_kernel: A very basic HIP kernel for device-to-device memory copy. While hipMemcpy is often optimized, a kernel can sometimes be used for specific access patterns or to keep the copy on the GPU explicitly. For this stress test, hipMemcpy for H2D/D2H and D2D (if peer access is enabled) is sufficient and often represents peak achievable bandwidth.
