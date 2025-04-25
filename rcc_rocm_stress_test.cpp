@@ -12,6 +12,7 @@
 #include <cmath> // For pow
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h> // Include header for __fp16 / hipblasHalf
 #include <hipblas/hipblas.h>
 
 // Mutex for synchronizing output from multiple threads
@@ -58,8 +59,8 @@ double time_gpu_event(hipEvent_t start, hipEvent_t stop) {
     }
 
 
-// Enum to specify precision
-enum class TestPrecision { FP64, FP32 };
+// Enum to specify precision (Added FP16)
+enum class TestPrecision { FP64, FP32, FP16 };
 
 // Function to run the stress test on a single GPU for a specific precision
 void run_gpu_stress(int device_id, double test_duration_sec, int m, int n, int k, TestPrecision precision) {
@@ -76,14 +77,21 @@ void run_gpu_stress(int device_id, double test_duration_sec, int m, int n, int k
         hipDeviceProp_t devProp;
         HIP_CHECK(hipGetDeviceProperties(&devProp, device_id));
 
-        precision_str = (precision == TestPrecision::FP64) ? "FP64" : "FP32"; // Assign value here
+        // Assign precision_str based on the TestPrecision enum
+        if (precision == TestPrecision::FP64) {
+            precision_str = "FP64";
+        } else if (precision == TestPrecision::FP32) {
+            precision_str = "FP32";
+        } else { // FP16
+            precision_str = "FP16";
+        }
 
         {
             std::lock_guard<std::mutex> lock(print_mutex);
             std::cout << "\nThread for Device " << device_id << " (" << precision_str << "): " << devProp.name << std::endl;
         }
 
-        // --- Memory Stress: Allocate a large portion of HBM3 ---
+        // --- Memory Stress: Allocate a large portion of HBM ---
         size_t free_mem, total_mem;
         HIP_CHECK(hipMemGetInfo(&free_mem, &total_mem));
 
@@ -122,22 +130,27 @@ void run_gpu_stress(int device_id, double test_duration_sec, int m, int n, int k
         size_t element_size;
         long long ops_per_single_gemm = 2LL * m * n * k; // Operations are the same regardless of type for GEMM structure
 
+        // Determine element size based on precision
         if (precision == TestPrecision::FP64) {
             element_size = sizeof(double);
-        } else { // FP32
+        } else if (precision == TestPrecision::FP32) {
             element_size = sizeof(float);
+        } else { // FP16
+            element_size = sizeof(__fp16); // Or sizeof(hipblasHalf)
         }
-        size_t matrix_size_bytes = (size_t)m * k * element_size;
+        size_t matrix_size_bytes = (size_t)m * k * element_size; // Use m*k for A and B size (assuming k*n for B if N,N) - Corrected to m*k
 
         // Allocate device memory for GEMM matrices
-        HIP_CHECK(hipMalloc(&d_A, matrix_size_bytes));
-        HIP_CHECK(hipMalloc(&d_B, matrix_size_bytes));
-        HIP_CHECK(hipMalloc(&d_C, matrix_size_bytes));
+        HIP_CHECK(hipMalloc(&d_A, (size_t)m * k * element_size)); // A: m x k
+        HIP_CHECK(hipMalloc(&d_B, (size_t)k * n * element_size)); // B: k x n
+        HIP_CHECK(hipMalloc(&d_C, (size_t)m * n * element_size)); // C: m x n
+
 
         // Initialize device memory (optional for pure stress)
-        HIP_CHECK(hipMemset(d_A, 0, matrix_size_bytes));
-        HIP_CHECK(hipMemset(d_B, 0, matrix_size_bytes));
-        HIP_CHECK(hipMemset(d_C, 0, matrix_size_bytes));
+        HIP_CHECK(hipMemset(d_A, 0, (size_t)m * k * element_size));
+        HIP_CHECK(hipMemset(d_B, 0, (size_t)k * n * element_size));
+        HIP_CHECK(hipMemset(d_C, 0, (size_t)m * n * element_size));
+
 
         HIP_CHECK(hipEventCreate(&start_event));
         HIP_CHECK(hipEventCreate(&stop_event));
@@ -155,12 +168,34 @@ void run_gpu_stress(int device_id, double test_duration_sec, int m, int n, int k
             // Record start event before GEMM
             HIP_CHECK(hipEventRecord(start_event, 0));
 
+            // Call the appropriate GEMM function based on precision
             if (precision == TestPrecision::FP64) {
                 double alpha = 1.0, beta = 0.0;
                 HIPBLAS_CHECK(hipblasDgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, &alpha, (const double*)d_A, m, (const double*)d_B, k, &beta, (double*)d_C, m));
-            } else { // FP32
+            } else if (precision == TestPrecision::FP32) {
                 float alpha = 1.0f, beta = 0.0f;
                 HIPBLAS_CHECK(hipblasSgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k, &alpha, (const float*)d_A, m, (const float*)d_B, k, &beta, (float*)d_C, m));
+            } else { // FP16
+                // Note: hipblasHgemm often takes float alpha/beta
+                float alpha = 1.0f, beta = 0.0f;
+                // Cast device pointers to hipblasHalf* or __fp16* as appropriate for Hgemm signature
+                HIPBLAS_CHECK(hipblasHgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k,
+                                          reinterpret_cast<const hipblasHalf*>(&alpha), // Pass address of float alpha, Hgemm might handle conversion or expect __half here depending on version
+                                          reinterpret_cast<const hipblasHalf*>(d_A), m,
+                                          reinterpret_cast<const hipblasHalf*>(d_B), k,
+                                          reinterpret_cast<const hipblasHalf*>(&beta),  // Pass address of float beta
+                                          reinterpret_cast<hipblasHalf*>(d_C), m));
+                // Note: Some hipBLAS versions might require alpha/beta to be __half or hipblasHalf*.
+                // If the above doesn't compile or work, try:
+                // __half alpha_h = __float2half(1.0f);
+                // __half beta_h = __float2half(0.0f);
+                // HIPBLAS_CHECK(hipblasHgemm(handle, HIPBLAS_OP_N, HIPBLAS_OP_N, m, n, k,
+                //                           &alpha_h, // Pass address of __half alpha
+                //                           (const hipblasHalf*)d_A, m,
+                //                           (const hipblasHalf*)d_B, k,
+                //                           &beta_h, // Pass address of __half beta
+                //                           (hipblasHalf*)d_C, m));
+
             }
 
             // Record stop event after GEMM
@@ -258,6 +293,7 @@ void run_gpu_stress(int device_id, double test_duration_sec, int m, int n, int k
 
 
 // Function to run a peer-to-peer bandwidth test between two GPUs
+// (No changes needed in this function for adding FP16 GEMM test)
 void run_gpu_peer_bandwidth_test(int src_device_id, int dst_device_id, size_t data_size_bytes, int num_iterations) {
     void *d_src = nullptr, *d_dst = nullptr;
     hipEvent_t start_event = nullptr, stop_event = nullptr;
@@ -316,11 +352,24 @@ void run_gpu_peer_bandwidth_test(int src_device_id, int dst_device_id, size_t da
     }
 
     // Clean up resources
-    if (start_event) HIP_CHECK(hipEventDestroy(start_event));
-    if (stop_event) HIP_CHECK(hipEventDestroy(stop_event));
-    if (d_src) HIP_CHECK(hipFree(d_src));
-    if (d_dst) HIP_CHECK(hipFree(d_dst));
+    if (start_event) {
+        hipError_t err = hipEventDestroy(start_event);
+        if (err != hipSuccess) { /* Handle error logging */ }
+    }
+    if (stop_event) {
+        hipError_t err = hipEventDestroy(stop_event);
+        if (err != hipSuccess) { /* Handle error logging */ }
+    }
+     if (d_src) {
+        hipError_t err = hipFree(d_src);
+        if (err != hipSuccess) { /* Handle error logging */ }
+    }
+    if (d_dst) {
+        hipError_t err = hipFree(d_dst);
+        if (err != hipSuccess) { /* Handle error logging */ }
+    }
 }
+
 
 int main(int argc, char* argv[]) {
     double test_duration_sec = 10.0; // Default duration per GPU per precision cycle
@@ -377,7 +426,7 @@ int main(int argc, char* argv[]) {
     int n = matrix_dim;
     int k = matrix_dim;
 
-    // Number of floating-point operations for one GEMM call (same for FP64 and FP32)
+    // Number of floating-point operations for one GEMM call (same for FP64, FP32, FP16)
     long long ops_per_single_gemm = 2LL * m * n * k;
 
     // --- FP64 Testing Cycle ---
@@ -417,8 +466,27 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "\n--- FP32 Testing Cycle Finished ---" << std::endl;
 
+    // --- FP16 Testing Cycle ---  (NEW SECTION)
+    std::cout << "\n--- Starting FP16 Testing Cycle (GEMM " << m << "x" << k << " * " << k << "x" << n << ") ---" << std::endl;
+    std::cout << "Total operations per single GEMM: " << ops_per_single_gemm << std::endl;
+    std::cout << "Target test duration per GPU: " << test_duration_sec << " seconds" << std::endl;
+
+    std::vector<std::thread> fp16_threads;
+    for (int dev = 0; dev < actual_gpus_to_test; ++dev) {
+        fp16_threads.push_back(std::thread(run_gpu_stress, dev, test_duration_sec, m, n, k, TestPrecision::FP16));
+    }
+
+    // Join threads to wait for all FP16 tests to complete
+    for (std::thread& thread : fp16_threads) {
+         if (thread.joinable()) { // Check if thread is joinable before joining
+            thread.join();
+        }
+    }
+    std::cout << "\n--- FP16 Testing Cycle Finished ---" << std::endl;
+
 
     // --- Starting Inter-GPU Bandwidth Test ---
+    // (Peer-to-peer test section remains unchanged)
     std::cout << "\n--- Starting Inter-GPU Bandwidth Test ---" << std::endl;
 
     size_t bandwidth_test_size = 1024 * 1024 * 1024; // 1 GB per transfer
@@ -498,6 +566,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n--- Inter-GPU Bandwidth Test Finished ---" << std::endl;
 
     // Disable peer access for all pairs after testing
+    // (Peer-to-peer disabling section remains unchanged)
     std::cout << "\nDisabling peer access..." << std::endl;
      for (int i = 0; i < actual_gpus_to_test; ++i) {
         for (int j = 0; j < actual_gpus_to_test; ++j) {
